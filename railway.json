@@ -1,0 +1,14 @@
+{
+  "$schema": "https://railway.com/railway.schema.json",
+  "build": {
+    "builder": "NIXPACKS",
+    "buildCommand": "mkdir -p bin && go build -o bin/termcall-signald ./cmd/termcall-signald"
+  },
+  "deploy": {
+    "startCommand": "./bin/termcall-signald",
+    "healthcheckPath": "/healthz",
+    "healthcheckTimeout": 30,
+    "restartPolicyType": "ON_FAILURE",
+    "numReplicas": 1
+  }
+}
