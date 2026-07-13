@@ -2,17 +2,21 @@ package protocol
 
 import (
 	"encoding/json"
+	"strings"
 	"time"
 )
 
 const (
-	ProtocolVersion      = 1
+	ProtocolVersion      = 2
 	MaxSignalMessageSize = 64 << 10
 	MaxSDPMessageSize    = 256 << 10
 	MaxICECandidateSize  = 4 << 10
 	MaxICECandidates     = 256
-	MinUsernameLength    = 3
-	MaxUsernameLength    = 32
+	MinBaseNameLength    = 3
+	MaxBaseNameLength    = 19
+	FingerprintLength    = 52
+	AddressSuffixLength  = 12
+	MaxAddressLength     = MaxBaseNameLength + 1 + AddressSuffixLength
 )
 
 type SignalType string
@@ -79,6 +83,30 @@ type PresencePayload struct {
 	Online bool `json:"online"`
 }
 
+// IdentityProof proves control of the private key behind a canonical address.
+// Nonces are single-use until ExpiresAt.
+type IdentityProof struct {
+	PublicKey string    `json:"public_key"`
+	ExpiresAt time.Time `json:"expires_at"`
+	Nonce     string    `json:"nonce"`
+	Signature string    `json:"signature"`
+}
+
+type SessionReadyPayload struct {
+	STUNURLs []string `json:"stun_urls,omitempty"`
+}
+
+type ICEServer struct {
+	URLs       []string `json:"urls"`
+	Username   string   `json:"username,omitempty"`
+	Credential string   `json:"credential,omitempty"`
+}
+
+type TURNCredentials struct {
+	ExpiresAt  time.Time   `json:"expires_at"`
+	ICEServers []ICEServer `json:"ice_servers"`
+}
+
 func (t SignalType) IsKnown() bool {
 	_, ok := knownSignalTypes[t]
 	return ok
@@ -97,4 +125,16 @@ func (t SignalType) RequiresCallID() bool {
 	default:
 		return false
 	}
+}
+
+func ValidSTUNURL(value string) bool {
+	return len(value) >= 8 && len(value) <= 512 &&
+		(strings.HasPrefix(value, "stun:") || strings.HasPrefix(value, "stuns:")) &&
+		!strings.ContainsAny(value, "\r\n\t ")
+}
+
+func ValidTURNURL(value string) bool {
+	return len(value) >= 8 && len(value) <= 512 &&
+		(strings.HasPrefix(value, "turn:") || strings.HasPrefix(value, "turns:")) &&
+		!strings.ContainsAny(value, "\r\n\t ")
 }

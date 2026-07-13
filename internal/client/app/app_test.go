@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -12,10 +13,14 @@ import (
 
 	"go.uber.org/goleak"
 
+	"termcall/internal/identity"
 	serverws "termcall/internal/server/websocket"
 )
 
 func TestForegroundClientsExchangeChat(t *testing.T) {
+	aliceID, aliceAddress := testIdentity(t, "alice")
+	bobID, bobAddress := testIdentity(t, "bob")
+	trust, _ := identity.OpenTrustStoreFile(filepath.Join(t.TempDir(), "trust.json"))
 	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 	server := serverws.New(serverws.Config{
 		PingInterval: time.Hour, IdleTimeout: 2 * time.Hour, SweepInterval: 10 * time.Millisecond,
@@ -45,17 +50,17 @@ func TestForegroundClientsExchangeChat(t *testing.T) {
 
 	go func() {
 		bobResult <- RunListen(ctx, Config{
-			Username: "bob", ServerURL: serverURL, Input: bobReader,
+			Address: bobAddress, Identity: bobID, TrustStore: trust, ServerURL: serverURL, Input: bobReader,
 			Output: &bobOutput, ErrorOutput: &bobOutput,
 		})
 	}()
-	waitForText(t, ctx, &bobOutput, "listening as bob")
+	waitForText(t, ctx, &bobOutput, "listening as "+bobAddress)
 
 	go func() {
 		aliceResult <- RunChat(ctx, Config{
-			Username: "alice", ServerURL: serverURL, Input: aliceReader,
+			Address: aliceAddress, Identity: aliceID, TrustStore: trust, ServerURL: serverURL, Input: aliceReader,
 			Output: &aliceOutput, ErrorOutput: &aliceOutput,
-		}, "bob")
+		}, bobAddress)
 	}()
 	waitForText(t, ctx, &bobOutput, "Accept? [y/N]")
 	writeLine(t, bobWriter, "y")
@@ -64,9 +69,9 @@ func TestForegroundClientsExchangeChat(t *testing.T) {
 
 	writeLine(t, aliceWriter, "hello bob")
 	waitForTextOrEarlyResult(t, ctx, &aliceOutput, "hello bob <you", aliceResult, bobResult)
-	waitForTextOrEarlyResult(t, ctx, &bobOutput, "alice> hello bob", aliceResult, bobResult)
+	waitForTextOrEarlyResult(t, ctx, &bobOutput, aliceAddress+"> hello bob", aliceResult, bobResult)
 	writeLine(t, bobWriter, "hello alice")
-	waitForText(t, ctx, &aliceOutput, "bob> hello alice")
+	waitForText(t, ctx, &aliceOutput, bobAddress+"> hello alice")
 	writeLine(t, aliceWriter, "/status")
 	waitForText(t, ctx, &aliceOutput, "route: direct/")
 	writeLine(t, aliceWriter, "/quit")
@@ -88,7 +93,7 @@ func TestInvitationCanBeDeclinedOrCanceled(t *testing.T) {
 		{
 			name:      "declined by listener",
 			act:       func(t *testing.T, _ io.Writer, bob io.Writer) { writeLine(t, bob, "n") },
-			aliceText: "bob declined", bobText: "declined",
+			aliceText: "declined", bobText: "declined",
 		},
 		{
 			name:      "canceled by caller",
@@ -98,6 +103,9 @@ func TestInvitationCanBeDeclinedOrCanceled(t *testing.T) {
 	} {
 		test := test
 		t.Run(test.name, func(t *testing.T) {
+			aliceID, aliceAddress := testIdentity(t, "alice")
+			bobID, bobAddress := testIdentity(t, "bob")
+			trust, _ := identity.OpenTrustStoreFile(filepath.Join(t.TempDir(), "trust.json"))
 			server := serverws.New(serverws.Config{PingInterval: time.Hour, IdleTimeout: 2 * time.Hour}, nil)
 			httpServer := httptest.NewServer(server.Handler())
 			defer httpServer.Close()
@@ -121,11 +129,11 @@ func TestInvitationCanBeDeclinedOrCanceled(t *testing.T) {
 			bobResult := make(chan error, 1)
 			aliceResult := make(chan error, 1)
 			go func() {
-				bobResult <- RunListen(ctx, Config{Username: "bob", ServerURL: serverURL, Input: bobReader, Output: &bobOutput, ErrorOutput: &bobOutput})
+				bobResult <- RunListen(ctx, Config{Address: bobAddress, Identity: bobID, TrustStore: trust, ServerURL: serverURL, Input: bobReader, Output: &bobOutput, ErrorOutput: &bobOutput})
 			}()
-			waitForText(t, ctx, &bobOutput, "listening as bob")
+			waitForText(t, ctx, &bobOutput, "listening as "+bobAddress)
 			go func() {
-				aliceResult <- RunChat(ctx, Config{Username: "alice", ServerURL: serverURL, Input: aliceReader, Output: &aliceOutput, ErrorOutput: &aliceOutput}, "bob")
+				aliceResult <- RunChat(ctx, Config{Address: aliceAddress, Identity: aliceID, TrustStore: trust, ServerURL: serverURL, Input: aliceReader, Output: &aliceOutput, ErrorOutput: &aliceOutput}, bobAddress)
 			}()
 			waitForText(t, ctx, &bobOutput, "Accept? [y/N]")
 			test.act(t, aliceWriter, bobWriter)
@@ -139,6 +147,68 @@ func TestInvitationCanBeDeclinedOrCanceled(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestEstablishedPeerSessionSurvivesSignalingShutdown(t *testing.T) {
+	aliceID, aliceAddress := testIdentity(t, "alice")
+	bobID, bobAddress := testIdentity(t, "bob")
+	trust, _ := identity.OpenTrustStoreFile(filepath.Join(t.TempDir(), "trust.json"))
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	server := serverws.New(serverws.Config{
+		PingInterval: time.Hour, IdleTimeout: 2 * time.Hour, SweepInterval: time.Second,
+	}, nil)
+	httpServer := httptest.NewServer(server.Handler())
+	defer httpServer.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	serverURL := "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/v1/ws"
+	bobReader, bobWriter := io.Pipe()
+	defer bobReader.Close()
+	defer bobWriter.Close()
+	aliceReader, aliceWriter := io.Pipe()
+	defer aliceReader.Close()
+	defer aliceWriter.Close()
+	var bobOutput, aliceOutput syncBuffer
+	bobResult := make(chan error, 1)
+	aliceResult := make(chan error, 1)
+	go func() {
+		bobResult <- RunListen(ctx, Config{Address: bobAddress, Identity: bobID, TrustStore: trust, ServerURL: serverURL, Input: bobReader, Output: &bobOutput, ErrorOutput: &bobOutput})
+	}()
+	waitForText(t, ctx, &bobOutput, "listening as "+bobAddress)
+	go func() {
+		aliceResult <- RunChat(ctx, Config{Address: aliceAddress, Identity: aliceID, TrustStore: trust, ServerURL: serverURL, Input: aliceReader, Output: &aliceOutput, ErrorOutput: &aliceOutput}, bobAddress)
+	}()
+	waitForText(t, ctx, &bobOutput, "Accept? [y/N]")
+	writeLine(t, bobWriter, "y")
+	waitForText(t, ctx, &aliceOutput, "[system] peer channel open\n")
+	waitForText(t, ctx, &bobOutput, "[system] peer channel open\n")
+
+	shutdownContext, shutdownCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	if err := server.Shutdown(shutdownContext); err != nil {
+		shutdownCancel()
+		t.Fatal(err)
+	}
+	shutdownCancel()
+	waitForTextOrEarlyResult(t, ctx, &aliceOutput, "peer session continues", aliceResult, bobResult)
+	waitForTextOrEarlyResult(t, ctx, &bobOutput, "peer session continues", aliceResult, bobResult)
+	writeLine(t, aliceWriter, "still connected")
+	waitForTextOrEarlyResult(t, ctx, &bobOutput, aliceAddress+"> still connected", aliceResult, bobResult)
+	writeLine(t, aliceWriter, "/quit")
+	waitForResult(t, ctx, "alice", aliceResult)
+	waitForResult(t, ctx, "bob", bobResult)
+}
+
+func testIdentity(t *testing.T, name string) (*identity.Identity, string) {
+	t.Helper()
+	value, err := identity.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	address, err := identity.CanonicalAddress(name, value.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return value, address
 }
 
 type syncBuffer struct {

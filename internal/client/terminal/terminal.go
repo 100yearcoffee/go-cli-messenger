@@ -16,6 +16,11 @@ import (
 	xterm "golang.org/x/term"
 )
 
+const (
+	enterScreen = "\x1b[?1049h\x1b[2J\x1b[H"
+	leaveScreen = "\x1b[0m\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1049l"
+)
+
 type Line struct {
 	Text string
 	Err  error
@@ -33,6 +38,9 @@ type UI struct {
 	outputFD    int
 	oldState    *xterm.State
 	restoreOnce sync.Once
+	videoCells  []byte
+	videoWidth  int
+	videoHeight int
 }
 
 func New(input io.Reader, output, errorsOutput io.Writer) *UI {
@@ -71,6 +79,10 @@ func New(input io.Reader, output, errorsOutput io.Writer) *UI {
 	u.inputFD = inputFD
 	u.outputFD = outputFD
 	u.oldState = oldState
+	// The alternate buffer keeps video redraws and status output out of the
+	// user's shell history. Restore emits a complete defensive reset on every
+	// normal, error, and signal-driven exit path.
+	_, _ = io.WriteString(output, enterScreen)
 	return u
 }
 
@@ -162,14 +174,85 @@ func (u *UI) Error(format string, arguments ...any) {
 	u.write(u.errors, "[error] "+format+"\n", arguments...)
 }
 
+// VideoSize clamps a configured profile to the current terminal viewport,
+// leaving four rows for status and chat input.
+func (u *UI) VideoSize(maxColumns, maxRows int) (int, int) {
+	if !u.interactive {
+		return maxColumns, maxRows
+	}
+	width, height, err := xterm.GetSize(u.outputFD)
+	if err != nil {
+		return maxColumns, maxRows
+	}
+	if width < maxColumns {
+		maxColumns = width
+	}
+	if availableRows := height - 4; availableRows < maxRows {
+		maxRows = availableRows
+	}
+	if maxColumns < 1 {
+		maxColumns = 1
+	}
+	if maxRows < 1 {
+		maxRows = 1
+	}
+	return maxColumns, maxRows
+}
+
+// RenderVideo updates only changed printable ASCII cells in a fixed viewport
+// at the top-left of an interactive terminal. Cursor save/restore keeps the
+// active chat input intact while frames arrive.
+func (u *UI) RenderVideo(columns, rows int, cells []byte) {
+	if !u.interactive || columns < 1 || rows < 1 || len(cells) != columns*rows {
+		return
+	}
+	for _, cell := range cells {
+		if cell < 0x20 || cell > 0x7e {
+			return
+		}
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	full := u.videoWidth != columns || u.videoHeight != rows || len(u.videoCells) != len(cells)
+	var output strings.Builder
+	output.Grow(len(cells) + rows*12)
+	output.WriteString("\x1b[s")
+	for row := 0; row < rows; row++ {
+		rowStart := row * columns
+		for column := 0; column < columns; {
+			index := rowStart + column
+			if !full && u.videoCells[index] == cells[index] {
+				column++
+				continue
+			}
+			start := column
+			for column < columns {
+				index = rowStart + column
+				if !full && u.videoCells[index] == cells[index] {
+					break
+				}
+				column++
+			}
+			fmt.Fprintf(&output, "\x1b[%d;%dH", row+1, start+1)
+			output.Write(cells[rowStart+start : rowStart+column])
+		}
+	}
+	output.WriteString("\x1b[u")
+	_, _ = io.WriteString(u.output, output.String())
+	u.videoCells = append(u.videoCells[:0], cells...)
+	u.videoWidth, u.videoHeight = columns, rows
+}
+
 // Restore returns an interactive terminal to its original mode.
 func (u *UI) Restore() {
 	u.restoreOnce.Do(func() {
+		u.mu.Lock()
+		defer u.mu.Unlock()
 		if u.oldState != nil {
 			_ = xterm.Restore(u.inputFD, u.oldState)
-			// ReadLine may already have drawn the next prompt before the app
-			// decided to exit. Remove it after restoring cooked terminal mode.
-			_, _ = io.WriteString(u.output, "\r\x1b[2K")
+			// Also undo cursor visibility, SGR, mouse modes, and the alternate
+			// screen even when a media or network error caused the exit.
+			_, _ = io.WriteString(u.output, leaveScreen)
 		}
 	})
 }

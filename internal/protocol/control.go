@@ -15,11 +15,13 @@ type ControlType string
 const (
 	ControlPeerHello     ControlType = "peer.hello"
 	ControlChatMessage   ControlType = "chat.message"
+	ControlVideoKeyframe ControlType = "video.keyframe_request"
+	ControlAudioState    ControlType = "audio.state"
 	ControlSessionHangup ControlType = "session.hangup"
 )
 
 var knownControlTypes = map[ControlType]struct{}{
-	ControlPeerHello: {}, ControlChatMessage: {}, ControlSessionHangup: {},
+	ControlPeerHello: {}, ControlChatMessage: {}, ControlVideoKeyframe: {}, ControlAudioState: {}, ControlSessionHangup: {},
 }
 
 type ControlMessage struct {
@@ -35,13 +37,20 @@ type ChatPayload struct {
 }
 
 type Capabilities struct {
-	TextChat   bool `json:"text_chat"`
-	ASCIIVideo bool `json:"ascii_video"`
-	Audio      bool `json:"audio"`
+	TextChat     bool `json:"text_chat"`
+	ASCIIVideo   bool `json:"ascii_video"`
+	ASCIIColumns int  `json:"ascii_columns,omitempty"`
+	ASCIIRows    int  `json:"ascii_rows,omitempty"`
+	ASCIIFPS     int  `json:"ascii_fps,omitempty"`
+	Audio        bool `json:"audio"`
 }
 
 type PeerHelloPayload struct {
 	Capabilities Capabilities `json:"capabilities"`
+}
+
+type AudioStatePayload struct {
+	Muted bool `json:"muted"`
 }
 
 func (t ControlType) IsKnown() bool {

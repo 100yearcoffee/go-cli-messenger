@@ -49,6 +49,41 @@ func TestCallLifecycle(t *testing.T) {
 	}
 }
 
+func TestConnectedCallAllowsBoundedICERestart(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	manager := New(Config{NegotiationTimeout: time.Minute})
+	call, err := manager.Invite("0191bdb0-0000-7000-8000-000000000099", "alice", "bob", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = manager.Transition(protocol.SignalCallAccept, call.ID, "bob", "alice", now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = manager.Transition(protocol.SignalWebRTCOffer, call.ID, "alice", "bob", now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = manager.Transition(protocol.SignalWebRTCICE, call.ID, "alice", "bob", now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = manager.Transition(protocol.SignalWebRTCAnswer, call.ID, "bob", "alice", now); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := manager.Transition(protocol.SignalWebRTCOffer, call.ID, "alice", "bob", now.Add(time.Second))
+	if err != nil {
+		t.Fatalf("restart offer: %v", err)
+	}
+	if restarted.State != StateNegotiating || restarted.CallerCandidates != 0 {
+		t.Fatalf("restart state = %#v", restarted)
+	}
+	if _, err = manager.Transition(protocol.SignalWebRTCAnswer, call.ID, "bob", "alice", now.Add(2*time.Second)); err != nil {
+		t.Fatalf("restart answer: %v", err)
+	}
+	if _, err = manager.Transition(protocol.SignalWebRTCOffer, call.ID, "bob", "alice", now.Add(3*time.Second)); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("callee restart offer error = %v, want ErrInvalidTransition", err)
+	}
+}
+
 func TestExpiryCleanupAndDisconnect(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)

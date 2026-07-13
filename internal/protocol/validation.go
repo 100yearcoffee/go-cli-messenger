@@ -18,7 +18,8 @@ var (
 	ErrInvalidMessage     = errors.New("invalid protocol message")
 
 	uuidPattern     = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
-	usernamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
+	baseNamePattern = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?$`)
+	addressPattern  = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?-[a-z2-7]{12}$`)
 )
 
 type Validator struct {
@@ -79,11 +80,11 @@ func (v Validator) ValidateSignal(message SignalMessage) error {
 	if !message.Type.IsKnown() {
 		return invalid("unknown signaling type %q", message.Type)
 	}
-	if message.From != "" && !ValidUsername(message.From) {
-		return invalid("invalid sender username %q", message.From)
+	if message.From != "" && message.From != "server" && !ValidAddress(message.From) {
+		return invalid("invalid sender address %q", message.From)
 	}
-	if message.To != "" && !ValidUsername(message.To) {
-		return invalid("invalid recipient username %q", message.To)
+	if message.To != "" && message.To != "server" && !ValidAddress(message.To) {
+		return invalid("invalid recipient address %q", message.To)
 	}
 	if message.Type.RequiresCallID() && !validUUID(message.CallID) {
 		return invalid("type %q requires a valid call ID", message.Type)
@@ -105,6 +106,18 @@ func (v Validator) ValidateSignal(message SignalMessage) error {
 	}
 
 	switch message.Type {
+	case SignalSessionReady:
+		if len(message.Payload) != 0 {
+			var payload SessionReadyPayload
+			if err := requiredPayload(message.Payload, &payload); err != nil || len(payload.STUNURLs) > 8 {
+				return invalid("session.ready contains invalid STUN configuration")
+			}
+			for _, value := range payload.STUNURLs {
+				if !ValidSTUNURL(value) {
+					return invalid("session.ready contains invalid STUN URL")
+				}
+			}
+		}
 	case SignalWebRTCOffer, SignalWebRTCAnswer:
 		var payload SDPPayload
 		if err := requiredPayload(message.Payload, &payload); err != nil || strings.TrimSpace(payload.SDP) == "" {
@@ -117,6 +130,14 @@ func (v Validator) ValidateSignal(message SignalMessage) error {
 		}
 		if payload.Candidate == "" || len(payload.Candidate) > MaxICECandidateSize {
 			return invalid("ICE candidate size must be between 1 and %d bytes", MaxICECandidateSize)
+		}
+	case SignalSessionHello, SignalCallInvite, SignalCallAccept:
+		var payload IdentityProof
+		if err := requiredPayload(message.Payload, &payload); err != nil ||
+			!validUUID(payload.Nonce) || payload.ExpiresAt.IsZero() ||
+			len(payload.PublicKey) < 40 || len(payload.PublicKey) > 64 ||
+			len(payload.Signature) < 80 || len(payload.Signature) > 128 {
+			return invalid("%s contains invalid identity proof", message.Type)
 		}
 	}
 
@@ -137,6 +158,11 @@ func (v Validator) ValidateControl(message ControlMessage) error {
 		if err := requiredPayload(message.Payload, &payload); err != nil || !payload.Capabilities.TextChat {
 			return invalid("peer.hello must advertise text_chat capability")
 		}
+		if payload.Capabilities.ASCIIVideo && (payload.Capabilities.ASCIIColumns < 1 || payload.Capabilities.ASCIIColumns > 200 ||
+			payload.Capabilities.ASCIIRows < 1 || payload.Capabilities.ASCIIRows > 80 ||
+			payload.Capabilities.ASCIIFPS < 1 || payload.Capabilities.ASCIIFPS > 30) {
+			return invalid("peer.hello contains an invalid ASCII video profile")
+		}
 	case ControlChatMessage:
 		var payload ChatPayload
 		if err := requiredPayload(message.Payload, &payload); err != nil {
@@ -148,9 +174,14 @@ func (v Validator) ValidateControl(message ControlMessage) error {
 		if !utf8.ValidString(payload.Text) || len(payload.Text) > MaxChatTextSize {
 			return invalid("chat text must be valid UTF-8 and at most %d bytes", MaxChatTextSize)
 		}
-	case ControlSessionHangup:
+	case ControlAudioState:
+		var payload AudioStatePayload
+		if err := requiredPayload(message.Payload, &payload); err != nil {
+			return invalid("audio.state requires a payload")
+		}
+	case ControlVideoKeyframe, ControlSessionHangup:
 		if len(message.Payload) != 0 && !bytes.Equal(bytes.TrimSpace(message.Payload), []byte("{}")) {
-			return invalid("session.hangup payload must be empty")
+			return invalid("%s payload must be empty", message.Type)
 		}
 	}
 
@@ -185,10 +216,15 @@ func (v Validator) validateCommon(version int, id string, timestamp time.Time) e
 	return nil
 }
 
-func ValidUsername(username string) bool {
-	return len(username) >= MinUsernameLength &&
-		len(username) <= MaxUsernameLength &&
-		usernamePattern.MatchString(username)
+func ValidBaseName(name string) bool {
+	return len(name) >= MinBaseNameLength && len(name) <= MaxBaseNameLength && baseNamePattern.MatchString(name)
+}
+
+func ValidAddress(address string) bool {
+	if len(address) < MinBaseNameLength+1+AddressSuffixLength || len(address) > MaxAddressLength || !addressPattern.MatchString(address) {
+		return false
+	}
+	return ValidBaseName(address[:len(address)-1-AddressSuffixLength])
 }
 
 func validUUID(value string) bool {

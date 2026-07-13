@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"termcall/internal/identity"
 	"termcall/internal/protocol"
 	serverws "termcall/internal/server/websocket"
 )
@@ -28,7 +29,11 @@ func TestClientHandshakePresenceAndHeartbeat(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	client, err := Connect(ctx, Config{URL: websocketURL(httpServer.URL), Username: "alice"})
+	alice, _ := identity.Generate()
+	aliceAddress, _ := identity.CanonicalAddress("alice", alice.PublicKey)
+	bob, _ := identity.Generate()
+	bobAddress, _ := identity.CanonicalAddress("bob", bob.PublicKey)
+	client, err := Connect(ctx, Config{URL: websocketURL(httpServer.URL), Address: aliceAddress, Identity: alice})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -36,7 +41,7 @@ func TestClientHandshakePresenceAndHeartbeat(t *testing.T) {
 
 	// Remaining connected beyond the idle timeout proves automatic pong handling.
 	time.Sleep(350 * time.Millisecond)
-	query, err := client.NewMessage(protocol.SignalPresenceQuery, "bob", "", nil)
+	query, err := client.NewMessage(protocol.SignalPresenceQuery, bobAddress, "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,8 +59,17 @@ func TestClientHandshakePresenceAndHeartbeat(t *testing.T) {
 		t.Fatal(ctx.Err())
 	}
 
-	if _, err := Connect(ctx, Config{URL: websocketURL(httpServer.URL), Username: "alice"}); err == nil {
+	if _, err := Connect(ctx, Config{URL: websocketURL(httpServer.URL), Address: aliceAddress, Identity: alice}); err == nil {
 		t.Fatal("duplicate username connection succeeded")
+	}
+}
+
+func TestRemotePlaintextAccessKeyIsRejectedBeforeDial(t *testing.T) {
+	value, _ := identity.Generate()
+	address, _ := identity.CanonicalAddress("alice", value.PublicKey)
+	_, err := Connect(context.Background(), Config{URL: "ws://signal.example/v1/ws", Address: address, Identity: value, AccessKey: "correct horse battery staple"})
+	if err == nil || !strings.Contains(err.Error(), "wss://") {
+		t.Fatalf("error = %v", err)
 	}
 }
 

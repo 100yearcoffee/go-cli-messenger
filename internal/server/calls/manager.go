@@ -148,8 +148,15 @@ func (m *Manager) Transition(messageType protocol.SignalType, callID, actor, rec
 		}
 		m.finish(call, StateCancelled, now)
 	case protocol.SignalWebRTCOffer:
-		if call.State != StateAccepted || actor != call.Caller {
+		// A second caller offer while connected is an ICE restart. Keep the
+		// original call identity, return to negotiation, and give the restarted
+		// gathering pass a fresh bounded candidate budget.
+		if (call.State != StateAccepted && call.State != StateConnected) || actor != call.Caller {
 			return Call{}, m.transitionError(call, messageType)
+		}
+		if call.State == StateConnected {
+			call.CallerCandidates = 0
+			call.CalleeCandidates = 0
 		}
 		m.setState(call, StateNegotiating, now, now.Add(m.config.NegotiationTimeout))
 	case protocol.SignalWebRTCAnswer:

@@ -5,12 +5,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/url"
 	"sync"
 	"time"
 
 	"github.com/coder/websocket"
 	"github.com/google/uuid"
 
+	"termcall/internal/identity"
 	"termcall/internal/protocol"
 )
 
@@ -21,17 +24,21 @@ var (
 
 type Config struct {
 	URL              string
-	Username         string
+	Address          string
 	QueueSize        int
 	HandshakeTimeout time.Duration
 	WriteTimeout     time.Duration
+	AccessKey        string
+	Identity         *identity.Identity
 }
 
 type Client struct {
-	username  string
+	address   string
+	identity  *identity.Identity
 	conn      *websocket.Conn
 	validator protocol.Validator
 	writeWait time.Duration
+	stunURLs  []string
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -51,11 +58,24 @@ type outboundMessage struct {
 }
 
 func Connect(ctx context.Context, config Config) (*Client, error) {
-	if !protocol.ValidUsername(config.Username) {
-		return nil, fmt.Errorf("invalid username %q", config.Username)
+	if !protocol.ValidAddress(config.Address) {
+		return nil, fmt.Errorf("invalid canonical address %q", config.Address)
+	}
+	if config.Identity == nil || !identity.AddressMatchesKey(config.Address, config.Identity.PublicKey) {
+		return nil, errors.New("canonical address requires its matching local identity")
 	}
 	if config.URL == "" {
 		return nil, errors.New("signaling URL is required")
+	}
+	parsedURL, err := url.Parse(config.URL)
+	if err != nil || (parsedURL.Scheme != "ws" && parsedURL.Scheme != "wss") || parsedURL.Host == "" {
+		return nil, errors.New("signaling URL must be a valid ws:// or wss:// URL")
+	}
+	if config.AccessKey != "" && parsedURL.Scheme == "ws" {
+		hostname := parsedURL.Hostname()
+		if hostname != "localhost" && hostname != "127.0.0.1" && hostname != "::1" {
+			return nil, errors.New("authenticated signaling requires wss:// for non-local servers")
+		}
 	}
 	if config.QueueSize <= 0 {
 		config.QueueSize = 64
@@ -72,7 +92,11 @@ func Connect(ctx context.Context, config Config) (*Client, error) {
 	clientContext, cancel := context.WithCancel(ctx)
 	handshakeContext, handshakeCancel := context.WithTimeout(clientContext, config.HandshakeTimeout)
 	defer handshakeCancel()
-	conn, _, err := websocket.Dial(handshakeContext, config.URL, nil)
+	dialOptions := &websocket.DialOptions{}
+	if config.AccessKey != "" {
+		dialOptions.HTTPHeader = http.Header{"Authorization": []string{"Bearer " + config.AccessKey}}
+	}
+	conn, _, err := websocket.Dial(handshakeContext, config.URL, dialOptions)
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("connect signaling WebSocket: %w", err)
@@ -81,7 +105,7 @@ func Connect(ctx context.Context, config Config) (*Client, error) {
 
 	validator := protocol.NewValidator()
 	client := &Client{
-		username: config.Username, conn: conn, validator: validator, writeWait: config.WriteTimeout,
+		address: config.Address, identity: config.Identity, conn: conn, validator: validator, writeWait: config.WriteTimeout,
 		ctx: clientContext, cancel: cancel, done: make(chan struct{}),
 		events: make(chan protocol.SignalMessage, config.QueueSize), errors: make(chan error, 1),
 		outbound: make(chan outboundMessage, config.QueueSize),
@@ -106,9 +130,17 @@ func Connect(ctx context.Context, config Config) (*Client, error) {
 		return nil, fmt.Errorf("read signaling ready: %w", err)
 	}
 	ready, err := protocol.DecodeSignal(data, validator)
-	if err != nil || messageType != websocket.MessageText || ready.Type != protocol.SignalSessionReady || ready.To != config.Username {
+	if err != nil || messageType != websocket.MessageText || ready.Type != protocol.SignalSessionReady || ready.To != config.Address {
 		client.Close()
 		return nil, fmt.Errorf("%w: %v", ErrUnexpectedHello, err)
+	}
+	if len(ready.Payload) != 0 {
+		var payload protocol.SessionReadyPayload
+		if err := json.Unmarshal(ready.Payload, &payload); err != nil {
+			client.Close()
+			return nil, fmt.Errorf("%w: invalid session configuration", ErrUnexpectedHello)
+		}
+		client.stunURLs = append([]string(nil), payload.STUNURLs...)
 	}
 
 	client.wg.Add(2)
@@ -128,7 +160,7 @@ func Connect(ctx context.Context, config Config) (*Client, error) {
 func (c *Client) NewMessage(messageType protocol.SignalType, to, callID string, payload any) (protocol.SignalMessage, error) {
 	message := protocol.SignalMessage{
 		Version: protocol.ProtocolVersion, ID: uuid.NewString(), Type: messageType,
-		Timestamp: time.Now().UTC(), CallID: callID, From: c.username, To: to,
+		Timestamp: time.Now().UTC(), CallID: callID, From: c.address, To: to,
 	}
 	if payload != nil {
 		encoded, err := json.Marshal(payload)
@@ -136,6 +168,16 @@ func (c *Client) NewMessage(messageType protocol.SignalType, to, callID string, 
 			return protocol.SignalMessage{}, fmt.Errorf("encode signaling payload: %w", err)
 		}
 		message.Payload = encoded
+	}
+	if payload == nil && (messageType == protocol.SignalSessionHello || messageType == protocol.SignalCallInvite || messageType == protocol.SignalCallAccept) {
+		proof, err := c.identity.Sign(messageType, callID, c.address, to, time.Now())
+		if err != nil {
+			return protocol.SignalMessage{}, err
+		}
+		message.Payload, err = json.Marshal(proof)
+		if err != nil {
+			return protocol.SignalMessage{}, err
+		}
 	}
 	if err := c.validator.ValidateSignal(message); err != nil {
 		return protocol.SignalMessage{}, err
@@ -175,6 +217,7 @@ func (c *Client) Send(ctx context.Context, message protocol.SignalMessage) error
 func (c *Client) Events() <-chan protocol.SignalMessage { return c.events }
 func (c *Client) Errors() <-chan error                  { return c.errors }
 func (c *Client) Done() <-chan struct{}                 { return c.done }
+func (c *Client) STUNURLs() []string                    { return append([]string(nil), c.stunURLs...) }
 
 func (c *Client) Close() {
 	c.closeOnce.Do(func() {

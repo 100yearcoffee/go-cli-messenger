@@ -58,3 +58,15 @@ func TestRightAlign(t *testing.T) {
 		t.Fatalf("narrow RightAlign() = %q", got)
 	}
 }
+
+func TestScreenLifecycleResetsTerminalFeatures(t *testing.T) {
+	t.Parallel()
+	if !strings.Contains(enterScreen, "?1049h") {
+		t.Fatal("interactive lifecycle does not enter the alternate screen")
+	}
+	for _, reset := range []string{"[0m", "?25h", "?1000l", "?1006l", "?1049l"} {
+		if !strings.Contains(leaveScreen, reset) {
+			t.Fatalf("terminal restore is missing %q", reset)
+		}
+	}
+}

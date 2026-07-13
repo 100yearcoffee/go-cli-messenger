@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
 
 	"termcall/internal/protocol"
@@ -14,7 +15,9 @@ import (
 
 const (
 	ControlChannelLabel = "control"
+	VideoChannelLabel   = "ascii-video"
 	defaultQueueSize    = 32
+	defaultVideoBuffer  = 256 << 10
 )
 
 var (
@@ -22,6 +25,8 @@ var (
 	ErrInvalidRole        = errors.New("invalid peer role")
 	ErrUnexpectedSignal   = errors.New("unexpected WebRTC signal")
 	ErrInvalidDataChannel = errors.New("invalid control data channel")
+	ErrAudioUnavailable   = errors.New("audio track is unavailable")
+	ErrVideoChannel       = errors.New("ASCII video channel failed")
 )
 
 type Role uint8
@@ -36,6 +41,8 @@ type EventType uint8
 const (
 	EventControlOpen EventType = iota + 1
 	EventControlMessage
+	EventVideoOpen
+	EventAudioOpen
 	EventConnectionState
 	EventError
 )
@@ -52,15 +59,19 @@ type Signal struct {
 type Event struct {
 	Type       EventType
 	Control    protocol.ControlMessage
+	Video      []byte
 	Connection webrtc.PeerConnectionState
 	Route      string
 	Err        error
 }
 
 type Config struct {
-	ICEServers []webrtc.ICEServer
-	QueueSize  int
-	Validator  protocol.Validator
+	ICEServers             []webrtc.ICEServer
+	QueueSize              int
+	Validator              protocol.Validator
+	MaxVideoBufferedAmount uint64
+	Audio                  bool
+	RelayOnly              bool
 }
 
 // Peer owns one Pion PeerConnection and its reliable, ordered control channel.
@@ -73,14 +84,23 @@ type Peer struct {
 	cancel context.CancelFunc
 	done   chan struct{}
 
-	signals  chan Signal
-	events   chan Event
-	outbound chan outboundMessage
-	ready    chan struct{}
+	signals       chan Signal
+	events        chan Event
+	videoFrames   chan []byte
+	audioPackets  chan *rtp.Packet
+	outbound      chan outboundMessage
+	ready         chan struct{}
+	videoOutbound chan []byte
+	videoReady    chan struct{}
 
-	channelMu sync.RWMutex
-	channel   *webrtc.DataChannel
-	readyOnce sync.Once
+	channelMu              sync.RWMutex
+	channel                *webrtc.DataChannel
+	videoChannel           *webrtc.DataChannel
+	readyOnce              sync.Once
+	videoReadyOnce         sync.Once
+	maxVideoBufferedAmount uint64
+	audioTrack             *webrtc.TrackLocalStaticRTP
+	negotiationMu          sync.Mutex
 
 	remoteMu          sync.Mutex
 	remoteDescription bool
@@ -118,27 +138,68 @@ func New(ctx context.Context, role Role, config Config) (*Peer, error) {
 		validator = protocol.NewValidator()
 	}
 
-	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{ICEServers: config.ICEServers})
+	peerConfiguration := webrtc.Configuration{ICEServers: config.ICEServers}
+	if config.RelayOnly {
+		peerConfiguration.ICETransportPolicy = webrtc.ICETransportPolicyRelay
+	}
+	pc, err := webrtc.NewPeerConnection(peerConfiguration)
 	if err != nil {
 		return nil, fmt.Errorf("create peer connection: %w", err)
 	}
 
 	peerContext, cancel := context.WithCancel(ctx)
 	p := &Peer{
-		role:      role,
-		pc:        pc,
-		validator: validator,
-		ctx:       peerContext,
-		cancel:    cancel,
-		done:      make(chan struct{}),
-		signals:   make(chan Signal, queueSize),
-		events:    make(chan Event, queueSize),
-		outbound:  make(chan outboundMessage, queueSize),
-		ready:     make(chan struct{}),
-		seenIDs:   make(map[string]struct{}, queueSize*4),
-		seenLimit: queueSize * 4,
+		role:          role,
+		pc:            pc,
+		validator:     validator,
+		ctx:           peerContext,
+		cancel:        cancel,
+		done:          make(chan struct{}),
+		signals:       make(chan Signal, queueSize),
+		events:        make(chan Event, queueSize),
+		videoFrames:   make(chan []byte, 1),
+		audioPackets:  make(chan *rtp.Packet, 10),
+		outbound:      make(chan outboundMessage, queueSize),
+		ready:         make(chan struct{}),
+		videoOutbound: make(chan []byte, 1),
+		videoReady:    make(chan struct{}),
+		seenIDs:       make(map[string]struct{}, queueSize*4),
+		seenLimit:     queueSize * 4,
+	}
+	p.maxVideoBufferedAmount = config.MaxVideoBufferedAmount
+	if p.maxVideoBufferedAmount == 0 {
+		p.maxVideoBufferedAmount = defaultVideoBuffer
 	}
 	p.installPeerHandlers()
+	if config.Audio {
+		track, trackErr := webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{
+			// WebRTC registers Opus with two RTP channels; the GStreamer
+			// capture pipeline still encodes a single microphone channel.
+			MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2,
+			SDPFmtpLine: "minptime=10;useinbandfec=1",
+		}, "audio", "termcall")
+		if trackErr != nil {
+			cancel()
+			_ = pc.Close()
+			return nil, fmt.Errorf("create Opus audio track: %w", trackErr)
+		}
+		sender, trackErr := pc.AddTrack(track)
+		if trackErr != nil {
+			cancel()
+			_ = pc.Close()
+			return nil, fmt.Errorf("add Opus audio track: %w", trackErr)
+		}
+		p.audioTrack = track
+		p.wg.Add(1)
+		go func() {
+			defer p.wg.Done()
+			for {
+				if _, _, err := sender.ReadRTCP(); err != nil {
+					return
+				}
+			}
+		}()
+	}
 
 	if role == RoleCaller {
 		ordered := true
@@ -153,22 +214,84 @@ func New(ctx context.Context, role Role, config Config) (*Peer, error) {
 			_ = pc.Close()
 			return nil, err
 		}
+		orderedVideo := false
+		maxRetransmits := uint16(0)
+		videoChannel, createErr := pc.CreateDataChannel(VideoChannelLabel, &webrtc.DataChannelInit{
+			Ordered: &orderedVideo, MaxRetransmits: &maxRetransmits,
+		})
+		if createErr != nil {
+			cancel()
+			_ = pc.Close()
+			return nil, fmt.Errorf("create ASCII video data channel: %w", createErr)
+		}
+		if err := p.attachVideoChannel(videoChannel); err != nil {
+			cancel()
+			_ = pc.Close()
+			return nil, err
+		}
 	} else {
 		pc.OnDataChannel(func(channel *webrtc.DataChannel) {
-			if err := p.attachControlChannel(channel); err != nil {
+			var err error
+			switch channel.Label() {
+			case ControlChannelLabel:
+				err = p.attachControlChannel(channel)
+			case VideoChannelLabel:
+				err = p.attachVideoChannel(channel)
+			default:
+				err = fmt.Errorf("%w: unexpected label %q", ErrInvalidDataChannel, channel.Label())
+			}
+			if err != nil {
 				p.emitEvent(Event{Type: EventError, Err: err})
 			}
 		})
 	}
 
-	p.wg.Add(1)
+	p.wg.Add(2)
 	go p.sendLoop()
+	go p.videoSendLoop()
 	go func() {
 		<-peerContext.Done()
 		_ = p.Close()
 	}()
 
 	return p, nil
+}
+
+func (p *Peer) SendAudio(packet *rtp.Packet) error {
+	if packet == nil {
+		return errors.New("audio packet is nil")
+	}
+	if p.audioTrack == nil {
+		return ErrAudioUnavailable
+	}
+	if err := p.contextError(); err != nil {
+		return err
+	}
+	if err := p.audioTrack.WriteRTP(packet); err != nil {
+		return fmt.Errorf("send Opus RTP: %w", err)
+	}
+	return nil
+}
+
+// SendVideo retains only the latest waiting frame. It returns false when the
+// channel is not open or its SCTP buffer is congested.
+func (p *Peer) SendVideo(data []byte) bool {
+	if len(data) == 0 {
+		return false
+	}
+	select {
+	case <-p.videoReady:
+	default:
+		return false
+	}
+	p.channelMu.RLock()
+	channel := p.videoChannel
+	p.channelMu.RUnlock()
+	if channel == nil || channel.BufferedAmount() >= p.maxVideoBufferedAmount {
+		return false
+	}
+	frame := append([]byte(nil), data...)
+	return queueLatest(p.videoOutbound, frame)
 }
 
 // Start creates the caller's offer. The callee starts when it receives that offer.
@@ -179,7 +302,26 @@ func (p *Peer) Start() error {
 	if err := p.contextError(); err != nil {
 		return err
 	}
-	offer, err := p.pc.CreateOffer(nil)
+	return p.createOffer(false)
+}
+
+// RestartICE gathers a fresh set of candidates without replacing the peer
+// connection or its media and data channels. Only the caller creates offers in
+// Only the caller initiates restart, avoiding glare and keeping signaling deterministic.
+func (p *Peer) RestartICE() error {
+	if p.role != RoleCaller {
+		return fmt.Errorf("%w: only the caller restarts ICE", ErrUnexpectedSignal)
+	}
+	if err := p.contextError(); err != nil {
+		return err
+	}
+	return p.createOffer(true)
+}
+
+func (p *Peer) createOffer(restart bool) error {
+	p.negotiationMu.Lock()
+	defer p.negotiationMu.Unlock()
+	offer, err := p.pc.CreateOffer(&webrtc.OfferOptions{ICERestart: restart})
 	if err != nil {
 		return fmt.Errorf("create offer: %w", err)
 	}
@@ -275,9 +417,11 @@ func (p *Peer) Status() (webrtc.PeerConnectionState, string) {
 	return p.state, p.route
 }
 
-func (p *Peer) Signals() <-chan Signal { return p.signals }
-func (p *Peer) Events() <-chan Event   { return p.events }
-func (p *Peer) Done() <-chan struct{}  { return p.done }
+func (p *Peer) Signals() <-chan Signal           { return p.signals }
+func (p *Peer) Events() <-chan Event             { return p.events }
+func (p *Peer) VideoFrames() <-chan []byte       { return p.videoFrames }
+func (p *Peer) AudioPackets() <-chan *rtp.Packet { return p.audioPackets }
+func (p *Peer) Done() <-chan struct{}            { return p.done }
 
 func (p *Peer) Close() error {
 	var closeErr error
@@ -312,6 +456,30 @@ func (p *Peer) installPeerHandlers() {
 			currentRoute = "unknown"
 		}
 		p.emitEvent(Event{Type: EventConnectionState, Connection: state, Route: currentRoute})
+	})
+	p.pc.OnTrack(func(track *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
+		if track.Kind() != webrtc.RTPCodecTypeAudio || track.Codec().MimeType != webrtc.MimeTypeOpus {
+			return
+		}
+		p.emitEvent(Event{Type: EventAudioOpen})
+		for {
+			packet, _, err := track.ReadRTP()
+			if err != nil {
+				return
+			}
+			select {
+			case p.audioPackets <- packet:
+			default:
+				select {
+				case <-p.audioPackets:
+				default:
+				}
+				select {
+				case p.audioPackets <- packet:
+				default:
+				}
+			}
+		}
 	})
 }
 
@@ -350,6 +518,56 @@ func (p *Peer) attachControlChannel(channel *webrtc.DataChannel) error {
 	return nil
 }
 
+func (p *Peer) attachVideoChannel(channel *webrtc.DataChannel) error {
+	if channel.Label() != VideoChannelLabel || channel.Ordered() || channel.MaxRetransmits() == nil || *channel.MaxRetransmits() != 0 {
+		return fmt.Errorf("%w: invalid ASCII video channel", ErrInvalidDataChannel)
+	}
+	p.channelMu.Lock()
+	if p.videoChannel != nil && p.videoChannel != channel {
+		p.channelMu.Unlock()
+		return fmt.Errorf("%w: duplicate ASCII video channel", ErrInvalidDataChannel)
+	}
+	p.videoChannel = channel
+	p.channelMu.Unlock()
+	channel.OnOpen(func() {
+		p.videoReadyOnce.Do(func() { close(p.videoReady) })
+		p.emitEvent(Event{Type: EventVideoOpen})
+	})
+	channel.OnMessage(func(message webrtc.DataChannelMessage) {
+		if len(message.Data) > 64<<10 {
+			p.emitEvent(Event{Type: EventError, Err: fmt.Errorf("ASCII video frame exceeds size limit")})
+			return
+		}
+		frame := append([]byte(nil), message.Data...)
+		queueLatest(p.videoFrames, frame)
+	})
+	channel.OnError(func(err error) {
+		p.emitEvent(Event{Type: EventError, Err: fmt.Errorf("%w: %v", ErrVideoChannel, err)})
+	})
+	return nil
+}
+
+// queueLatest bounds a real-time stream to one waiting item. Replacing the
+// stale item is preferable to building latency when capture, rendering, or the
+// network falls behind.
+func queueLatest(queue chan []byte, value []byte) bool {
+	select {
+	case queue <- value:
+		return true
+	default:
+	}
+	select {
+	case <-queue:
+	default:
+	}
+	select {
+	case queue <- value:
+		return true
+	default:
+		return false
+	}
+}
+
 func (p *Peer) sendLoop() {
 	defer p.wg.Done()
 	for {
@@ -380,6 +598,31 @@ func (p *Peer) sendLoop() {
 	}
 }
 
+func (p *Peer) videoSendLoop() {
+	defer p.wg.Done()
+	select {
+	case <-p.videoReady:
+	case <-p.ctx.Done():
+		return
+	}
+	for {
+		select {
+		case <-p.ctx.Done():
+			return
+		case frame := <-p.videoOutbound:
+			p.channelMu.RLock()
+			channel := p.videoChannel
+			p.channelMu.RUnlock()
+			if channel == nil || channel.BufferedAmount() >= p.maxVideoBufferedAmount {
+				continue
+			}
+			if err := channel.Send(frame); err != nil {
+				p.emitEvent(Event{Type: EventError, Err: fmt.Errorf("%w: send frame: %v", ErrVideoChannel, err)})
+			}
+		}
+	}
+}
+
 func (p *Peer) selectedRoute() string {
 	sctp := p.pc.SCTP()
 	if sctp == nil || sctp.Transport() == nil || sctp.Transport().ICETransport() == nil {
@@ -394,6 +637,11 @@ func (p *Peer) selectedRoute() string {
 		kind = "relay"
 	}
 	protocolName := pair.Local.Protocol.String()
+	if kind == "relay" {
+		if relayProtocol := p.selectedRelayProtocol(); relayProtocol != "" {
+			protocolName = relayProtocol
+		}
+	}
 	if protocolName == "" {
 		protocolName = pair.Remote.Protocol.String()
 	}
@@ -403,7 +651,28 @@ func (p *Peer) selectedRoute() string {
 	return kind + "/" + protocolName
 }
 
+func (p *Peer) selectedRelayProtocol() string {
+	report := p.pc.GetStats()
+	for _, statistic := range report {
+		pair, ok := statistic.(webrtc.ICECandidatePairStats)
+		if !ok || !pair.Nominated || pair.State != webrtc.StatsICECandidatePairStateSucceeded {
+			continue
+		}
+		candidateStatistic, exists := report[pair.LocalCandidateID]
+		if !exists {
+			continue
+		}
+		candidate, ok := candidateStatistic.(webrtc.ICECandidateStats)
+		if ok && candidate.RelayProtocol != "" {
+			return candidate.RelayProtocol
+		}
+	}
+	return ""
+}
+
 func (p *Peer) applyDescription(description webrtc.SessionDescription) error {
+	p.negotiationMu.Lock()
+	defer p.negotiationMu.Unlock()
 	switch description.Type {
 	case webrtc.SDPTypeOffer:
 		if p.role != RoleCallee {

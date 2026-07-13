@@ -15,9 +15,13 @@ import (
 	"github.com/coder/websocket"
 	"github.com/google/uuid"
 
+	"termcall/internal/identity"
 	"termcall/internal/protocol"
+	"termcall/internal/server/access"
 	"termcall/internal/server/calls"
+	"termcall/internal/server/httpapi"
 	"termcall/internal/server/presence"
+	turncredentials "termcall/internal/server/turn"
 )
 
 var (
@@ -40,6 +44,9 @@ type Config struct {
 	InviteLimit        int
 	InviteWindow       time.Duration
 	Now                func() time.Time
+	Access             *access.Gate
+	STUNURLs           []string
+	TURN               *turncredentials.Issuer
 }
 
 func DefaultConfig() Config {
@@ -69,6 +76,9 @@ type Server struct {
 	ctx         context.Context
 	cancel      context.CancelFunc
 	wg          sync.WaitGroup
+	identityMu  sync.Mutex
+	suffixes    map[string]string
+	replays     identity.ReplayGuard
 }
 
 func New(config Config, logger *slog.Logger) *Server {
@@ -124,6 +134,7 @@ func New(config Config, logger *slog.Logger) *Server {
 			CleanupAfter: config.CleanupAfter,
 		}),
 		userInvites: newKeyedFixedWindowLimiter(config.InviteLimit, config.InviteWindow),
+		suffixes:    make(map[string]string),
 		ctx:         ctx, cancel: cancel,
 	}
 	server.wg.Add(1)
@@ -133,6 +144,7 @@ func New(config Config, logger *slog.Logger) *Server {
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
+	httpapi.RegisterTURN(mux, s.config.Access, s.config.TURN)
 	mux.HandleFunc("GET /v1/ws", s.handleWebSocket)
 	mux.HandleFunc("GET /healthz", statusHandler)
 	mux.HandleFunc("GET /readyz", statusHandler)
@@ -162,6 +174,10 @@ func statusHandler(writer http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handleWebSocket(writer http.ResponseWriter, request *http.Request) {
+	if !s.config.Access.Authorize(request) {
+		http.Error(writer, "valid bearer access key is required", http.StatusUnauthorized)
+		return
+	}
 	conn, err := websocket.Accept(writer, request, &websocket.AcceptOptions{
 		CompressionMode: websocket.CompressionDisabled,
 	})
@@ -196,14 +212,31 @@ func (s *Server) serve(client *clientConnection) {
 	if err != nil || hello.Type != protocol.SignalSessionHello {
 		return
 	}
+	proof, _, fingerprint, err := identity.Verify(hello, s.now())
+	if err != nil || !s.replays.Accept(fingerprint, proof.Nonce, proof.ExpiresAt, s.now()) {
+		_ = client.conn.Close(websocket.StatusPolicyViolation, "identity proof failed")
+		return
+	}
+	suffix := fingerprint[:protocol.AddressSuffixLength]
+	s.identityMu.Lock()
+	knownFingerprint, collision := s.suffixes[suffix]
+	if !collision {
+		s.suffixes[suffix] = fingerprint
+	}
+	s.identityMu.Unlock()
+	if collision && knownFingerprint != fingerprint {
+		_ = client.conn.Close(websocket.StatusPolicyViolation, "identity suffix collision")
+		return
+	}
 	client.username = hello.From
+	client.fingerprint = fingerprint
 	if err := s.presence.Register(client); err != nil {
 		_ = client.conn.Close(websocket.StatusPolicyViolation, "username already connected")
 		return
 	}
 	client.registered.Store(true)
 	client.touch(s.now())
-	if err := client.Deliver(s.message(protocol.SignalSessionReady, "server", client.username, "", nil)); err != nil {
+	if err := client.Deliver(s.message(protocol.SignalSessionReady, "server", client.username, "", protocol.SessionReadyPayload{STUNURLs: s.config.STUNURLs})); err != nil {
 		return
 	}
 	s.logger.Info("signaling client connected", "user", client.username)
@@ -257,6 +290,9 @@ func (s *Server) dispatch(client *clientConnection, message protocol.SignalMessa
 		_, online := s.presence.Get(message.To)
 		return client.Deliver(s.message(protocol.SignalPresenceResult, "server", client.username, "", protocol.PresencePayload{Online: online}))
 	case protocol.SignalCallInvite:
+		if err := s.verifyBoundProof(client, message); err != nil {
+			return err
+		}
 		if !client.invites.Allow(now) || !s.userInvites.Allow(client.username, now) {
 			return ErrRateLimited
 		}
@@ -276,7 +312,15 @@ func (s *Server) dispatch(client *clientConnection, message protocol.SignalMessa
 			return ErrPeerOffline
 		}
 		return client.Deliver(s.message(protocol.SignalCallRinging, message.To, client.username, message.CallID, nil))
-	case protocol.SignalCallAccept, protocol.SignalCallDecline, protocol.SignalCallCancel,
+	case protocol.SignalCallAccept:
+		if err := s.verifyBoundProof(client, message); err != nil {
+			return err
+		}
+		if _, err := s.calls.Transition(message.Type, message.CallID, client.username, message.To, now); err != nil {
+			return err
+		}
+		return s.deliverTo(message.To, message)
+	case protocol.SignalCallDecline, protocol.SignalCallCancel,
 		protocol.SignalCallEnd, protocol.SignalWebRTCOffer, protocol.SignalWebRTCAnswer,
 		protocol.SignalWebRTCICE, protocol.SignalWebRTCICEComplete:
 		if _, err := s.calls.Transition(message.Type, message.CallID, client.username, message.To, now); err != nil {
@@ -286,6 +330,14 @@ func (s *Server) dispatch(client *clientConnection, message protocol.SignalMessa
 	default:
 		return ErrUnauthorized
 	}
+}
+
+func (s *Server) verifyBoundProof(client *clientConnection, message protocol.SignalMessage) error {
+	proof, _, fingerprint, err := identity.Verify(message, s.now())
+	if err != nil || fingerprint != client.fingerprint || !s.replays.Accept(fingerprint, proof.Nonce, proof.ExpiresAt, s.now()) {
+		return fmt.Errorf("%w: invalid or replayed identity proof", ErrUnauthorized)
+	}
+	return nil
 }
 
 func (s *Server) deliverTo(username string, message protocol.SignalMessage) error {
@@ -306,6 +358,10 @@ func (s *Server) disconnect(client *clientConnection) {
 		return
 	}
 	s.presence.Unregister(client)
+	if s.ctx.Err() != nil {
+		s.logger.Info("signaling client disconnected during shutdown", "user", client.username)
+		return
+	}
 	for _, call := range s.calls.Disconnect(client.username, s.now()) {
 		other, err := call.Other(client.username)
 		if err == nil {
@@ -380,20 +436,21 @@ func errorCode(err error) string {
 }
 
 type clientConnection struct {
-	server     *Server
-	conn       *websocket.Conn
-	username   string
-	send       chan []byte
-	done       chan struct{}
-	closeOnce  sync.Once
-	registered atomic.Bool
-	lastSeen   atomic.Int64
-	seenMu     sync.Mutex
-	seenIDs    map[string]struct{}
-	seenOrder  []string
-	seenLimit  int
-	invites    *fixedWindowLimiter
-	wg         sync.WaitGroup
+	server      *Server
+	conn        *websocket.Conn
+	username    string
+	fingerprint string
+	send        chan []byte
+	done        chan struct{}
+	closeOnce   sync.Once
+	registered  atomic.Bool
+	lastSeen    atomic.Int64
+	seenMu      sync.Mutex
+	seenIDs     map[string]struct{}
+	seenOrder   []string
+	seenLimit   int
+	invites     *fixedWindowLimiter
+	wg          sync.WaitGroup
 }
 
 func newClientConnection(server *Server, conn *websocket.Conn) *clientConnection {

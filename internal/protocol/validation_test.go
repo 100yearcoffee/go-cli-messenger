@@ -17,15 +17,19 @@ func testValidator() Validator {
 }
 
 func validSignal(messageType SignalType) SignalMessage {
-	return SignalMessage{
+	message := SignalMessage{
 		Version:   ProtocolVersion,
 		ID:        "0191bda8-41c0-7cb8-a2fd-71ab5d784f53",
 		Type:      messageType,
 		Timestamp: testNow,
 		CallID:    "0191bda8-a022-765a-9af0-bfe74b1190f1",
-		From:      "alice",
-		To:        "bob",
+		From:      "alice-abcdefghijkl",
+		To:        "bob-abcdefghijkl",
 	}
+	if messageType == SignalSessionHello || messageType == SignalCallInvite || messageType == SignalCallAccept {
+		message.Payload = json.RawMessage(`{"public_key":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","expires_at":"2026-07-13T12:01:00Z","nonce":"0191bdb0-c0d5-7588-b687-8f5ed8016c8f","signature":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`)
+	}
+	return message
 }
 
 func validControl(messageType ControlType) ControlMessage {
@@ -50,7 +54,7 @@ func TestValidateSignal(t *testing.T) {
 		name   string
 		mutate func(*SignalMessage)
 	}{
-		{"version", func(message *SignalMessage) { message.Version = 2 }},
+		{"version", func(message *SignalMessage) { message.Version = 1 }},
 		{"message ID", func(message *SignalMessage) { message.ID = "not-a-uuid" }},
 		{"unknown type", func(message *SignalMessage) { message.Type = "future.message" }},
 		{"old timestamp", func(message *SignalMessage) { message.Timestamp = testNow.Add(-25 * time.Hour) }},
@@ -148,17 +152,20 @@ func TestValidateControl(t *testing.T) {
 	}
 }
 
-func TestValidUsername(t *testing.T) {
+func TestValidBaseNameAndAddress(t *testing.T) {
 	t.Parallel()
 
-	for _, username := range []string{"alice", "bob_2", "user-name"} {
-		if !ValidUsername(username) {
-			t.Errorf("ValidUsername(%q) = false", username)
+	for _, name := range []string{"alice", "bob_2", "user-name"} {
+		if !ValidBaseName(name) {
+			t.Errorf("ValidBaseName(%q) = false", name)
 		}
 	}
-	for _, username := range []string{"ab", "Alice", "bad name", strings.Repeat("a", 33)} {
-		if ValidUsername(username) {
-			t.Errorf("ValidUsername(%q) = true", username)
+	for _, name := range []string{"ab", "Alice", "bad name", "-alice", "alice-", strings.Repeat("a", 20)} {
+		if ValidBaseName(name) {
+			t.Errorf("ValidBaseName(%q) = true", name)
 		}
+	}
+	if !ValidAddress("alice-abcdefghijkl") || ValidAddress("alice") || ValidAddress("alice-abcdefghijk1") {
+		t.Fatal("canonical address validation failed")
 	}
 }
