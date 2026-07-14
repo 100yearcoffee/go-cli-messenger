@@ -1,3 +1,24 @@
+# Why?
+
+I bet you've seen those hacker movies/animes where someone is using a laptop and a terminal screen pops up with a message in it, and the main character starts chatting with someone. THIS is the reason for this project.
+
+This command is exactly for it:
+
+```sh
+./bin/termcall daemon --detached --incoming open-terminal
+```
+
+Just for fun, for friends and maybe your coworkers (if you're not in big tech that will probably yell at ya)
+
+TBH I wanted P2P as I was thinking about no servers, etc, but if you're not in the same network it's hard to achieve it. You still need something that will help you get around NAT, but since you need a server (like here) maybe it makes no sense for P2P here, idk.
+
+There is a video stream that gets morphed into ASCII in terminal but, meh.
+I will probably remove it, too much hustle and you need drivers to support that.
+
+For it to work follow the intructions below, the go server is easy to deploy with Railway. 2-3 ENVs and that's it.
+
+Boring text below.
+
 # Termcall
 
 Termcall is a peer-to-peer terminal calling application for Linux and macOS. It uses a small signaling service to introduce callers, then carries text chat, audio, and ASCII video directly between peers over WebRTC.
