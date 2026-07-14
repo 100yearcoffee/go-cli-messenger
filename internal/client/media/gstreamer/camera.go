@@ -31,17 +31,13 @@ func (c *Camera) Open(ctx context.Context, config media.VideoConfig) (<-chan med
 	if _, err := exec.LookPath("gst-launch-1.0"); err != nil {
 		return nil, errors.New("GStreamer is required for camera capture (gst-launch-1.0 was not found)")
 	}
-	device := config.Device
-	if device == "" {
-		device = "/dev/video0"
-	}
 	width, height := config.Columns, config.Rows*2
-	arguments := []string{
-		"-q", "v4l2src", "device=" + device,
+	arguments := append([]string{"-q"}, cameraSource(config.Device)...)
+	arguments = append(arguments,
 		"!", "videoconvert", "!", "videoscale",
 		"!", fmt.Sprintf("video/x-raw,format=GRAY8,width=%d,height=%d,framerate=%d/1", width, height, config.FPS),
 		"!", "fdsink", "fd=1", "sync=false",
-	}
+	)
 	captureContext, cancel := context.WithCancel(ctx)
 	command := exec.CommandContext(captureContext, "gst-launch-1.0", arguments...)
 	stdout, err := command.StdoutPipe()

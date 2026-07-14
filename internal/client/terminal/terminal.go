@@ -12,7 +12,6 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"golang.org/x/sys/unix"
 	xterm "golang.org/x/term"
 )
 
@@ -60,13 +59,7 @@ func New(input io.Reader, output, errorsOutput io.Writer) *UI {
 	}
 	// Keep terminal-generated signals such as Ctrl+C while retaining raw-mode
 	// line editing for every other key.
-	termios, err := unix.IoctlGetTermios(inputFD, unix.TCGETS)
-	if err != nil {
-		_ = xterm.Restore(inputFD, oldState)
-		return u
-	}
-	termios.Lflag |= unix.ISIG
-	if err := unix.IoctlSetTermios(inputFD, unix.TCSETS, termios); err != nil {
+	if err := enableTerminalSignals(inputFD); err != nil {
 		_ = xterm.Restore(inputFD, oldState)
 		return u
 	}

@@ -3,9 +3,7 @@
 all: check build
 
 build:
-	mkdir -p bin
-	go build -o bin/termcall ./cmd/termcall
-	go build -o bin/termcall-signald ./cmd/termcall-signald
+	./scripts/build
 
 fmt:
 	gofmt -w $$(find cmd internal test -name '*.go' -type f 2>/dev/null)

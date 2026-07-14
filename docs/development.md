@@ -1,6 +1,6 @@
 # Development
 
-Build and verify with `make build`, `go test ./...`, `go test -race ./...`, and `go vet ./...`.
+Build and verify with `make build`, `go test ./...`, `go test -race ./...`, and `go vet ./...`. The default build detects the host platform; use `./scripts/build --platform darwin` or `./scripts/build --platform linux` for an explicit target.
 
 Start a local open server with `./bin/termcall-signald`. Initialize separate configuration homes, then use the address printed by `termcall identity`:
 

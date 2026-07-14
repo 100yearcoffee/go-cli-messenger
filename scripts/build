@@ -1,0 +1,62 @@
+#!/bin/sh
+
+set -eu
+
+platform=""
+explicit=false
+
+usage() {
+	echo "usage: ./scripts/build [--platform linux|darwin]" >&2
+}
+
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+		--platform)
+			[ "$#" -ge 2 ] || { usage; exit 2; }
+			platform=$2
+			explicit=true
+			shift 2
+			;;
+		--platform=*)
+			platform=${1#*=}
+			explicit=true
+			shift
+			;;
+		-h|--help)
+			usage
+			exit 0
+			;;
+		*)
+			echo "unknown argument: $1" >&2
+			usage
+			exit 2
+			;;
+	esac
+done
+
+if [ -z "$platform" ]; then
+	platform=$(go env GOOS)
+fi
+if [ "$platform" = "macos" ]; then
+	platform=darwin
+fi
+case "$platform" in
+	linux|darwin) ;;
+	*)
+		echo "unsupported platform: $platform (expected linux or darwin)" >&2
+		exit 2
+		;;
+esac
+
+architecture=$(go env GOARCH)
+mkdir -p bin
+
+if [ "$explicit" = true ]; then
+	suffix="-$platform-$architecture"
+else
+	suffix=""
+fi
+
+echo "Building termcall for $platform/$architecture"
+GOOS=$platform GOARCH=$architecture CGO_ENABLED=0 go build -o "bin/termcall$suffix" ./cmd/termcall
+GOOS=$platform GOARCH=$architecture CGO_ENABLED=0 go build -o "bin/termcall-signald$suffix" ./cmd/termcall-signald

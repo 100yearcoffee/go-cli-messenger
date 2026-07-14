@@ -1,18 +1,25 @@
 # Termcall
 
-Termcall is a peer-to-peer terminal calling application for Linux. It uses a small signaling service to introduce callers, then carries text chat, audio, and ASCII video directly between peers over WebRTC.
+Termcall is a peer-to-peer terminal calling application for Linux and macOS. It uses a small signaling service to introduce callers, then carries text chat, audio, and ASCII video directly between peers over WebRTC.
 
 Identity is based on a locally generated Ed25519 key—not an account or password. Each installation gets a canonical address such as `alice-abc234def567`, and callers can verify, trust, or block the full key fingerprint.
 
 ## Build
 
-Termcall requires Go 1.26 or newer. Audio and camera features also require the relevant Linux GStreamer plugins and devices.
+Termcall requires Go 1.26 or newer. Audio and camera features also require GStreamer and the relevant platform plugins. Linux camera capture uses V4L2; macOS uses AVFoundation. On macOS, grant camera and microphone access to your terminal when prompted. Text-only calls have no native media dependency.
 
 ```sh
 make build
 ```
 
-This creates `bin/termcall` and `bin/termcall-signald`.
+The build detects the host operating system and architecture and creates `bin/termcall` and `bin/termcall-signald`. To build explicitly for another supported platform, use `--platform` (`macos` is accepted as an alias for `darwin`):
+
+```sh
+./scripts/build --platform darwin
+./scripts/build --platform linux
+```
+
+Explicit platform builds include the target in their filenames so they do not overwrite native binaries, for example `bin/termcall-darwin-arm64`.
 
 ## Run locally
 
