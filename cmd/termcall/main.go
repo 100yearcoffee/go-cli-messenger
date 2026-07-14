@@ -20,6 +20,7 @@ import (
 
 	"termcall/internal/buildinfo"
 	"termcall/internal/client/app"
+	"termcall/internal/client/asciivideo"
 	clientdaemon "termcall/internal/client/daemon"
 	"termcall/internal/client/diagnostics"
 	"termcall/internal/client/profile"
@@ -390,7 +391,7 @@ type mediaFlags struct {
 func addMediaFlags(flags *flag.FlagSet) mediaFlags {
 	return mediaFlags{
 		video: flags.Bool("video", true, "capture and send ASCII camera video"), camera: flags.String("camera", "", "camera device (/dev path on Linux, numeric index on macOS)"),
-		columns: flags.Int("video-columns", 100, "maximum ASCII video columns"), rows: flags.Int("video-rows", 34, "maximum ASCII video rows"), fps: flags.Int("video-fps", 15, "maximum ASCII video FPS"),
+		columns: flags.Int("video-columns", asciivideo.DefaultColumns, "maximum ASCII video columns"), rows: flags.Int("video-rows", asciivideo.DefaultRows, "maximum ASCII video rows"), fps: flags.Int("video-fps", 15, "maximum ASCII video FPS"),
 		audio: flags.Bool("audio", true, "send and play Opus audio"), microphone: flags.String("microphone", "", "microphone device"), speaker: flags.String("speaker", "", "speaker device"), bitrate: flags.Int("audio-bitrate", 32000, "Opus bitrate"), relayOnly: flags.Bool("relay-only", false, "require TURN relay"),
 	}
 }

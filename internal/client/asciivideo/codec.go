@@ -13,6 +13,8 @@ const (
 	ColorMonochrome   = 0
 	MaxColumns        = 200
 	MaxRows           = 80
+	DefaultColumns    = MaxColumns
+	DefaultRows       = MaxRows
 	MaxEncodedSize    = 64 << 10
 	headerSize        = 26
 )

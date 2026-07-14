@@ -13,9 +13,17 @@ import (
 
 	"go.uber.org/goleak"
 
+	"termcall/internal/client/asciivideo"
 	"termcall/internal/identity"
 	serverws "termcall/internal/server/websocket"
 )
+
+func TestLocalVideoCapabilitiesDefaultToMaximumQuality(t *testing.T) {
+	capabilities := localCapabilities(Config{Video: true})
+	if capabilities.ASCIIColumns != asciivideo.DefaultColumns || capabilities.ASCIIRows != asciivideo.DefaultRows {
+		t.Fatalf("default video size = %dx%d, want %dx%d", capabilities.ASCIIColumns, capabilities.ASCIIRows, asciivideo.DefaultColumns, asciivideo.DefaultRows)
+	}
+}
 
 func TestForegroundClientsExchangeChat(t *testing.T) {
 	aliceID, aliceAddress := testIdentity(t, "alice")

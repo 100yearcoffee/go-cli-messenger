@@ -891,10 +891,10 @@ func localCapabilities(config Config) protocol.Capabilities {
 	capabilities.ASCIIRows = config.VideoRows
 	capabilities.ASCIIFPS = config.VideoFPS
 	if capabilities.ASCIIColumns < 1 || capabilities.ASCIIColumns > asciivideo.MaxColumns {
-		capabilities.ASCIIColumns = 100
+		capabilities.ASCIIColumns = asciivideo.DefaultColumns
 	}
 	if capabilities.ASCIIRows < 1 || capabilities.ASCIIRows > asciivideo.MaxRows {
-		capabilities.ASCIIRows = 34
+		capabilities.ASCIIRows = asciivideo.DefaultRows
 	}
 	if capabilities.ASCIIFPS < 1 || capabilities.ASCIIFPS > 30 {
 		capabilities.ASCIIFPS = 15
