@@ -70,3 +70,30 @@ func TestScreenLifecycleResetsTerminalFeatures(t *testing.T) {
 		}
 	}
 }
+
+func TestVideoRendererUsesCompactFullRedrawForNoisyFrame(t *testing.T) {
+	const columns, rows = 100, 40
+	previous := []byte(strings.Repeat("a", columns*rows))
+	cells := []byte(strings.Repeat("a", columns*rows))
+	for index := range cells {
+		if index%2 == 0 {
+			cells[index] = 'b'
+		}
+	}
+	output := renderVideoUpdate(previous, columns, rows, columns, rows, cells)
+	if len(output) > len(cells)+rows*12 {
+		t.Fatalf("noisy frame output has %d bytes for %d cells", len(output), len(cells))
+	}
+	if strings.Count(output, "H") != rows {
+		t.Fatalf("full redraw used %d cursor moves, want %d", strings.Count(output, "H"), rows)
+	}
+}
+
+func TestVideoRendererKeepsSmallIncrementalUpdate(t *testing.T) {
+	previous := []byte("abcdefgh")
+	cells := []byte("abcXefgh")
+	output := renderVideoUpdate(previous, 4, 2, 4, 2, cells)
+	if strings.Contains(output, "abcd") || !strings.Contains(output, "X") {
+		t.Fatalf("small update was not rendered incrementally: %q", output)
+	}
+}

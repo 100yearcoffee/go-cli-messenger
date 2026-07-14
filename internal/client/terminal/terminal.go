@@ -206,7 +206,14 @@ func (u *UI) RenderVideo(columns, rows int, cells []byte) {
 	}
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	full := u.videoWidth != columns || u.videoHeight != rows || len(u.videoCells) != len(cells)
+	output := renderVideoUpdate(u.videoCells, u.videoWidth, u.videoHeight, columns, rows, cells)
+	_, _ = io.WriteString(u.output, output)
+	u.videoCells = append(u.videoCells[:0], cells...)
+	u.videoWidth, u.videoHeight = columns, rows
+}
+
+func renderVideoUpdate(previous []byte, previousColumns, previousRows, columns, rows int, cells []byte) string {
+	full := previousColumns != columns || previousRows != rows || len(previous) != len(cells)
 	var output strings.Builder
 	output.Grow(len(cells) + rows*12)
 	output.WriteString("\x1b[s")
@@ -214,14 +221,14 @@ func (u *UI) RenderVideo(columns, rows int, cells []byte) {
 		rowStart := row * columns
 		for column := 0; column < columns; {
 			index := rowStart + column
-			if !full && u.videoCells[index] == cells[index] {
+			if !full && previous[index] == cells[index] {
 				column++
 				continue
 			}
 			start := column
 			for column < columns {
 				index = rowStart + column
-				if !full && u.videoCells[index] == cells[index] {
+				if !full && previous[index] == cells[index] {
 					break
 				}
 				column++
@@ -231,9 +238,19 @@ func (u *UI) RenderVideo(columns, rows int, cells []byte) {
 		}
 	}
 	output.WriteString("\x1b[u")
-	_, _ = io.WriteString(u.output, output.String())
-	u.videoCells = append(u.videoCells[:0], cells...)
-	u.videoWidth, u.videoHeight = columns, rows
+	if full || output.Len() <= len(cells)+rows*12 {
+		return output.String()
+	}
+
+	output.Reset()
+	output.Grow(len(cells) + rows*12)
+	output.WriteString("\x1b[s")
+	for row := 0; row < rows; row++ {
+		fmt.Fprintf(&output, "\x1b[%d;1H", row+1)
+		output.Write(cells[row*columns : (row+1)*columns])
+	}
+	output.WriteString("\x1b[u")
+	return output.String()
 }
 
 // Restore returns an interactive terminal to its original mode.
