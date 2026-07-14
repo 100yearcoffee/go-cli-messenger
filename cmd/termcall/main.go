@@ -9,7 +9,9 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -201,11 +203,15 @@ func runDaemon(ctx context.Context, arguments []string) error {
 	incoming := flags.String("incoming", string(clientdaemon.BehaviorOpenTerminal), "incoming behavior: open-terminal, print, or ignore")
 	dnd := flags.Bool("do-not-disturb", false, "decline incoming calls")
 	terminalCommand := flags.String("terminal", "", "terminal emulator executable")
+	detached := flags.Bool("detached", false, "run the daemon in the background")
 	if err := flags.Parse(arguments); err != nil {
 		return err
 	}
 	if flags.NArg() != 0 {
 		return errorsUsage("daemon received unexpected arguments")
+	}
+	if *detached {
+		return startDetachedDaemon(daemonChildArguments(*socketPath, *incoming, *dnd, *terminalCommand))
 	}
 	value, localIdentity, err := loadProfileIdentity()
 	if err != nil {
@@ -243,6 +249,44 @@ func runDaemon(ctx context.Context, arguments []string) error {
 		return nil
 	}
 	return clientdaemon.Run(ctx, clientdaemon.Config{Username: value.Address, SocketPath: *socketPath, Behavior: clientdaemon.Behavior(*incoming), DoNotDisturb: *dnd, Terminal: *terminalCommand, Connect: connect, Output: os.Stdout, ErrorOutput: os.Stderr, VerifyInvitation: verify})
+}
+
+func daemonChildArguments(socketPath, incoming string, dnd bool, terminalCommand string) []string {
+	arguments := []string{"daemon", "--socket", socketPath, "--incoming", incoming}
+	if dnd {
+		arguments = append(arguments, "--do-not-disturb")
+	}
+	if terminalCommand != "" {
+		arguments = append(arguments, "--terminal", terminalCommand)
+	}
+	return arguments
+}
+
+func startDetachedDaemon(arguments []string) error {
+	executable, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("locate termcall executable: %w", err)
+	}
+	command := exec.Command(executable, arguments...)
+	command.SysProcAttr = detachedProcessAttributes()
+	if err := command.Start(); err != nil {
+		return fmt.Errorf("start detached daemon: %w", err)
+	}
+	pid := command.Process.Pid
+	if err := command.Process.Release(); err != nil {
+		return fmt.Errorf("release detached daemon process: %w", err)
+	}
+	fmt.Fprintf(os.Stdout, "termcall daemon started in background (PID %d)\nstop it with: %s\n", pid, daemonStopCommand(pid))
+	return nil
+}
+
+func daemonStopCommand(pid int) string {
+	switch runtime.GOOS {
+	case "windows":
+		return fmt.Sprintf("taskkill /PID %d", pid)
+	default:
+		return fmt.Sprintf("kill %d", pid)
+	}
 }
 
 func runIncoming(ctx context.Context, arguments []string, decline bool) error {
@@ -418,7 +462,7 @@ func usage() {
   termcall init <base-name> [--server <ws-url>]
   termcall identity
   termcall trust|untrust|block|unblock <fingerprint-or-known-prefix>
-  termcall daemon [--incoming open-terminal|print|ignore] [--do-not-disturb]
+  termcall daemon [--detached] [--incoming open-terminal|print|ignore] [--do-not-disturb]
   termcall answer|decline <call-id>
   termcall listen [media flags]
   termcall chat <canonical-address> [media flags]
