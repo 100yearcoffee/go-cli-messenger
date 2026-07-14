@@ -25,6 +25,10 @@ Termcall is a peer-to-peer terminal calling application for Linux and macOS. It 
 
 Identity is based on a locally generated Ed25519 key—not an account or password. Each installation gets a canonical address such as `alice-abc234def567`, and callers can verify, trust, or block the full key fingerprint.
 
+## Platform support
+
+Termcall currently supports Linux and macOS. Windows is not supported.
+
 ## Build
 
 Termcall requires Go 1.26 or newer. Audio and camera features also require GStreamer and the relevant platform plugins. Linux camera capture uses V4L2; macOS uses AVFoundation. On macOS, grant camera and microphone access to your terminal when prompted. Text-only calls have no native media dependency.
