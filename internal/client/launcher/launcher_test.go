@@ -22,3 +22,12 @@ func TestResolveKeepsCallIDAsOneArgument(t *testing.T) {
 		t.Fatalf("got %#v, want program /usr/bin/kitty args %#v", command, want)
 	}
 }
+
+func TestMacOSTerminalCommandPassesValuesAsArguments(t *testing.T) {
+	command := macOSTerminalCommand("/usr/bin/osascript", "/Applications/Term Call/bin/termcall", "call-id;touch /tmp/bad")
+	wantTail := []string{"--", "/Applications/Term Call/bin/termcall", "call-id;touch /tmp/bad"}
+	if command.Program != "/usr/bin/osascript" || len(command.Args) < len(wantTail) ||
+		!reflect.DeepEqual(command.Args[len(command.Args)-len(wantTail):], wantTail) {
+		t.Fatalf("got %#v, want program /usr/bin/osascript with argument tail %#v", command, wantTail)
+	}
+}

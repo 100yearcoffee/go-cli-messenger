@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
@@ -51,7 +52,25 @@ func Resolve(configured, executable, callID string, lookup func(string) (string,
 		arguments = append(arguments, executable, "answer", callID)
 		return Command{Program: path, Args: arguments}, nil
 	}
+	if runtime.GOOS == "darwin" {
+		path, err := lookup("osascript")
+		if err == nil {
+			return macOSTerminalCommand(path, executable, callID), nil
+		}
+	}
 	return Command{}, ErrNoTerminal
+}
+
+func macOSTerminalCommand(osascript, executable, callID string) Command {
+	const script = `on run argv
+set executablePath to item 1 of argv
+set callID to item 2 of argv
+tell application "Terminal"
+activate
+do script (quoted form of executablePath) & " answer " & (quoted form of callID)
+end tell
+end run`
+	return Command{Program: osascript, Args: []string{"-e", script, "--", executable, callID}}
 }
 
 func terminalPrefix(program string) []string {
